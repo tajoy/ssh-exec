@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+#  -*- coding: utf-8 -*-
+# create by Tajoy
+from __future__ import print_function
+
+import os
+import sys
+import re
+from optparse import OptionParser
+import pexpect
+from pexpect import pxssh
+import time
+import multiprocessing
+
+# try:  
+#     import cPickle as pickle  
+# except ImportError:
+#     import pickle
+
+str_login = '''
+================================================================
+    节点 %s > 登录
+================================================================
+'''
+
+str_login_failed = '''
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    节点 %s > !!! 登录失败 !!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+'''
+
+str_begin = '''
+================================================================
+    节点 %s > 开始执行
+================================================================
+'''
+
+str_error = '''
+=====================================================================
+    节点 %s > 执行出错,停止
+=====================================================================
+'''
+
+str_over = '''
+================================================================
+    节点 %s > 结束执行
+================================================================
+'''
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+class NodeList(object):
+    """解析节点列表, 并提供迭代功能"""
+    def __init__(self, nodesfile):
+        super(NodeList, self).__init__()
+        self.nodes = []
+        self.nodesfile = nodesfile
+        lines = self.nodesfile.split('\n')
+        regex_comment = re.compile(r'#.+$')
+        regex_empty = re.compile(r'\s+')
+        regex_parms = re.compile(r'\s*([^\s]+)\s+([^\s]+)\s+([^\s]+)\s*')
+        line_num = 0
+        for line in lines:
+            line_num = line_num + 1
+            # 删除注释
+            result = regex_comment.search(line)
+            while result:
+                line = regex_comment.sub(r'', line)
+                result = regex_comment.search(line)
+
+            # 跳过空行
+            if len(line) == 0 or regex_empty.fullmatch(line):
+                continue
+
+            # 提取信息
+            match = regex_parms.fullmatch(line)
+            if match:
+                node = {
+                    "addr": match.group(1),
+                    "user": match.group(2),
+                    "pwd": match.group(3)
+                }
+                self.nodes.append(node)
+            else:
+                eprint('解析节点列表文件出错, 行: %d' % line_num)
+                os._exit(-2)
+
+    def __iter__(self):
+        return self.nodes.__iter__()
+
+
+class MyLogFile(object):
+    """docstring for MyLogFile"""
+    def __init__(self, filepath):
+        super(MyLogFile, self).__init__()
+        self.file = open(filepath, 'wb')
+
+    def __del__(self):
+        self.file.close()
+
+    def write(self, s):
+        sys.stdout.buffer.write(s)
+        self.file.write(s)
+
+    def flush(self):
+        self.file.flush()
+
+
+class ScriptRunner(object):
+    """脚本运行器, 用于在某一节点上运行脚本"""
+    def __init__(self, node, script):
+        super(ScriptRunner, self).__init__()
+        self.node = node
+        # self.script = re.sub(r'\\\n', r'', script)
+        self.script = script
+
+    def run(self):
+        userDir = os.path.expanduser('~')
+        dataDir = os.path.join(userDir, '.ssh-exec')
+        if not os.path.isdir(dataDir):
+            os.mkdir(dataDir)
+
+        logfile = MyLogFile(os.path.join(dataDir, self.node["addr"] + ".log"))
+        s = pxssh.pxssh(logfile=logfile)
+
+        print(str_login % self.node["addr"])
+        try:
+            s.login(self.node["addr"], self.node["user"], self.node["pwd"])
+        except Exception as e:
+            eprint(str_login_failed % self.node["addr"])
+            return
+
+        print(str_begin % self.node["addr"])
+        s.send(self.script + '\n')
+        while True:
+            i = s.expect([
+                r'\[sudo\] password for \w+',
+                r'\[PEXPECT\]\$',
+                pexpect.EOF,
+                pexpect.TIMEOUT
+            ])
+            if i == 0:
+                time.sleep(0.5)
+                s.sendline(self.node["pwd"])
+                # time.sleep(0.5)
+                # s.prompt()
+            elif i == 1:
+                s.sendline('logout')
+                break
+            elif i == 2:
+                break
+            else:
+                s.prompt()
+                s.sendline('logout')
+                break
+        s.close()
+        print(str_over % self.node["addr"])
+
+
+class MainLoop(object):
+    """程序主循环, 用于循环执行每个节点的脚本"""
+    def __init__(self, options, args):
+        super(MainLoop, self).__init__()
+        self.options = options
+        self.args = args
+        self.nodeslist = None
+        self.script = None
+        self.nodesfile = None
+        self.init()
+
+    def init(self):
+        if not self.options.script is None:
+            f = None
+            try:
+                f = open(self.options.script)
+                self.script = f.read()
+            except Exception as e:
+                eprint(e)
+                os._exit(e.errno)
+            finally:
+                if f:
+                    f.close()
+        elif len(self.args) > 0:
+            self.script = '\n'.join(self.args)
+        else:
+            eprint('没有指定脚本或命令!')
+            os._exit(-1)
+
+        if not self.options.nodesfile is None:
+            f = None
+            try:
+                f = open(self.options.nodesfile)
+                self.nodesfile = f.read()
+            except Exception as e:
+                print(e)
+            finally:
+                if f:
+                    f.close()
+        else:
+            eprint('没有指定节点列表文件!')
+        self.nodeslist = NodeList(self.nodesfile)
+
+    def run_one_by_one(self):
+        for node in self.nodeslist:
+            runner = ScriptRunner(node, self.script)
+            runner.run()
+
+    def run_meantime(self):
+        def run_inter(pipe):
+            runner = pipe.recv()
+            ScriptRunner.run(runner)
+
+        procs = []
+        for node in self.nodeslist:
+            runner = ScriptRunner(node, self.script)
+            pipe = multiprocessing.Pipe()
+            p = multiprocessing.Process(
+                target=run_inter,
+                args=(pipe[1],)
+            )
+            procs.append(p)
+            p.start()
+            pipe[0].send(runner)
+        for p in procs:
+            p.join()
+
+
+def main():
+    parser = OptionParser()
+    parser.add_option(
+        "-f", "--nodesfile",
+        dest="nodesfile",
+        help="所有节点的列表文件",
+        metavar="文件路径"
+    )
+    # parser.add_option(
+    #     "-n",
+    #     "--nodes",
+    #     dest="nodes",
+    #     help="所有节点的列表文件",
+    #     metavar="文件路径"
+    # )
+    parser.add_option(
+        "-s",
+        "--script",
+        dest="script",
+        help="在每个节点运行的脚本",
+        metavar="脚本路径"
+    )
+    parser.add_option(
+        "-o",
+        "--one-by-one",
+        action="store_false",
+        dest="parallel",
+        default=True,
+        help="顺序执行"
+    )
+    (options, args) = parser.parse_args()
+    loop = MainLoop(options, args)
+    loop.run_meantime()
+    if options.parallel:
+        loop.run_meantime()
+    else:
+        loop.run_one_by_one()
+
+if __name__ == '__main__':
+    main()
